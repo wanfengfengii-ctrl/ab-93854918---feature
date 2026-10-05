@@ -1,4 +1,4 @@
-"""复原冒烟：含漏读标记与划痕亮点（杂点）的栅格复原。
+"""复原与复核冒烟：含漏读标记与划痕亮点（杂点）的栅格复原，及审计接口。
 
 可直接运行（不依赖服务）；verify 流程在服务健康后通过 BASE_URL 走 HTTP，
 同时保留对核心算法的直测。用法::
@@ -13,6 +13,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.audit import audit_candidate  # noqa: E402
 from app.solver import reconstruct  # noqa: E402
 
 BOUNDS = {
@@ -137,6 +138,142 @@ def main():
         print("==> 直测求解器冒烟")
     check_result(result)
     print("==> 冒烟通过：漏读 4 格 + 2 划痕亮点均正确处理")
+    run_audit_smoke(points, result, base_url)
+
+
+# ---------------------------------------------------------------------------
+# 复核（audit）冒烟：成功 + 三类拒绝原因码
+# ---------------------------------------------------------------------------
+def candidate_from_result(result, **over):
+    """从复原结果构造规范候选；over 可篡改参数/声明以制造拒绝场景。"""
+    p = result["parameters"]
+    cand = {
+        "origin": list(p["origin"]),
+        "row_vector": list(p["row_vector"]),
+        "col_vector": list(p["col_vector"]),
+        "cells": [
+            {"id": a["id"], "row": a["row"], "col": a["col"]}
+            for a in result["assignments"]
+            if a["adopted"]
+        ],
+        "discarded": [
+            {"id": a["id"]}
+            for a in result["assignments"]
+            if not a["adopted"]
+        ],
+    }
+    cand.update(over)
+    return cand
+
+
+def _http_post_json(base_url, path, payload):
+    import urllib.request
+
+    req = urllib.request.Request(
+        base_url.rstrip("/") + path,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def _request_payload(points, rows, cols, tolerance, max_outliers):
+    return {
+        "points": [{"id": i, "x": x, "y": y} for i, x, y in points],
+        "rows": rows,
+        "cols": cols,
+        "max_outliers": max_outliers,
+        "tolerance": tolerance,
+        "origin_bounds": {"x": {"lo": -3, "hi": 3}, "y": {"lo": -3, "hi": 3}},
+        "row_vector_bounds": {"x": {"lo": -3, "hi": 3}, "y": {"lo": -3, "hi": 3}},
+        "col_vector_bounds": {"x": {"lo": -3, "hi": 3}, "y": {"lo": -3, "hi": 3}},
+    }
+
+
+def _audit(points, candidate, base_url, rows=4, cols=4, tolerance=1, max_outliers=2):
+    payload = {
+        "reconstruction_request": _request_payload(
+            points, rows, cols, tolerance, max_outliers
+        ),
+        "candidate": candidate,
+    }
+    if base_url:
+        return _http_post_json(base_url, "/api/wafer-grids/audit", payload)
+    pts = [(p["id"], p["x"], p["y"]) for p in payload["reconstruction_request"]["points"]]
+    return audit_candidate(pts, rows, cols, tolerance, max_outliers, BOUNDS, candidate)
+
+
+def _assert_rejected(body, code):
+    assert body["accepted"] is False, body
+    assert body["reason_code"] == code, body
+    # 拒绝时不得回显正确分配
+    assert "assignments" not in body and "parameters" not in body, body
+
+
+def run_audit_smoke(points, result, base_url):
+    mode = f"HTTP ({base_url})" if base_url else "直测"
+    print(f"==> [{mode}] 复核冒烟：成功 + 不可行 + 次优 + 同优但非规范")
+
+    # 1) 规范候选 → accepted，目标由服务端计算
+    body = _audit(points, candidate_from_result(result), base_url)
+    assert body["accepted"] is True, body
+    obj = body["objective"]
+    assert (
+        obj["discarded_count"],
+        obj["max_manhattan_residual"],
+        obj["total_manhattan_residual"],
+    ) == (2, 1, 3), obj
+    assert "assignments" not in body, body
+
+    # 2) 交换两基向量制造 det=-9 → infeasible
+    bad_det = candidate_from_result(
+        result,
+        row_vector=list(result["parameters"]["col_vector"]),
+        col_vector=list(result["parameters"]["row_vector"]),
+    )
+    _assert_rejected(_audit(points, bad_det, base_url), "infeasible")
+
+    # 3) 次优：3x3 精确栅格、允许弃 1，候选把一个精确点声明为弃点
+    exact = [(r * 3 + c + 1, 2 * r, 2 * c) for r in range(3) for c in range(3)]
+    exact_res = reconstruct(exact, 3, 3, 1, 1, BOUNDS)
+    assert exact_res["objective"]["discarded_count"] == 0
+    sub = candidate_from_result(exact_res)
+    victim = sub["cells"].pop(0)
+    sub["discarded"].append({"id": victim["id"]})
+    body = _audit(exact, sub, base_url, rows=3, cols=3, max_outliers=1)
+    _assert_rejected(body, "suboptimal")
+
+    # 4) 同目标但非规范：两个标记都位于 (1,0)，对格位 (0,0) 与 (1,0)
+    #    残差同为 1；两种互异占用目标值相同，规范结果按编号字典序确定，
+    #    交换占用即非规范结果。
+    tie_pts = [(1, 1, 0), (2, 1, 0)]
+    pid = 3
+    for r in range(3):
+        for c in range(3):
+            if (r, c) in ((0, 0), (1, 0)):
+                continue
+            tie_pts.append((pid, 2 * r, 2 * c))
+            pid += 1
+    tie_res = reconstruct(tie_pts, 3, 3, 1, 2, BOUNDS)
+    assert tie_res["objective"] == {
+        "discarded_count": 0,
+        "max_manhattan_residual": 1,
+        "total_manhattan_residual": 2,
+    }
+    noncanon = candidate_from_result(tie_res)
+    for cell in noncanon["cells"]:
+        if cell["id"] == 1:
+            cell["row"], cell["col"] = 1, 0
+        if cell["id"] == 2:
+            cell["row"], cell["col"] = 0, 0
+    _assert_rejected(
+        _audit(tie_pts, noncanon, base_url, rows=3, cols=3, max_outliers=2),
+        "non_canonical",
+    )
+
+    print("==> 复核冒烟通过：accepted / infeasible / suboptimal / non_canonical")
 
 
 if __name__ == "__main__":

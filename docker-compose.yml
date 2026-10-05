@@ -7,7 +7,8 @@ services:
     ports:
       - "${API_PORT:-8000}:${API_PORT:-8000}"
 
-  # 一次性校验任务：等待 web 健康后执行单元测试与含漏读/杂点的复原冒烟，
+  # 一次性校验任务：等待 web 健康后执行单元测试，以及含漏读/杂点的复原冒烟
+  # 与成功/拒绝（infeasible/suboptimal/non_canonical）审计冒烟，
   # 以自身退出码汇报结果。用 ./verify（或 docker compose run --rm verify）触发。
   verify:
     build: .
