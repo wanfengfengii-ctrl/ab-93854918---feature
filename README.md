@@ -35,7 +35,9 @@ API_PORT=9000 ./verify
 `verify` 容器执行：
 
 1. `pytest` 代码测试；
-2. 复原冒烟（4×4 栅格漏读 4 格 + 2 个划痕亮点 + 坐标抖动，经 HTTP 提交）；
+2. 应用构建（字节码编译 + 应用导入检查）；
+3. 复原冒烟（4×4 栅格漏读 4 格 + 2 个划痕亮点 + 坐标抖动，经 HTTP 提交）；
+4. 审计冒烟（成功复核 + 不可行/次优/同优非规范三类拒绝 + 结构错误 422）；
 
 并以自身退出码汇报（成功 0）。单独启动服务：`API_PORT=9000 docker compose up web`。
 
@@ -68,6 +70,45 @@ API_PORT=9000 ./verify
 （建议放宽容差/区间或提高弃点上限）；请求本身不合法（编号重复、点数越界、
 区间跨度超 6 等）返回 HTTP 422 并附字段级错误。
 
+`POST /api/wafer-grids/audit`：复原结果写入对准设备前的服务端复核。接收
+`reconstruction_request`（同重建请求）与 `candidate`（原点、两条基向量、
+每个标记的格位或弃点声明）；残差与目标值由服务端计算，候选不提交：
+
+```json
+{
+  "reconstruction_request": { "...": "同 /api/wafer-grids/reconstruct 请求体" },
+  "candidate": {
+    "origin": [0, 0],
+    "row_vector": [3, 0],
+    "col_vector": [0, 3],
+    "assignments": [
+      {"id": 1, "row": 0, "col": 0},
+      {"id": 90, "discarded": true}
+    ]
+  }
+}
+```
+
+复核流程：候选须覆盖全部标记且各出现一次（否则 422 字段级错误）；随后逐项
+校验参数位于原区间、行列式为正、采用格位有效且互异、逐分量残差不越过容差、
+弃点数不超过原上限；最后按现有四级裁决重求规范解比对。一致时返回
+`{"accepted": true, "objective": {...}}`（目标值由服务端计算）；否则返回
+HTTP 200、`accepted: false` 及稳定原因码，**不回显正确分配**：
+
+| category         | reason_code                   | 含义                       |
+|------------------|-------------------------------|----------------------------|
+| `infeasible`     | `PARAMETERS_OUT_OF_BOUNDS`    | 参数超出原区间             |
+| `infeasible`     | `NON_POSITIVE_DETERMINANT`    | 行列式非正                 |
+| `infeasible`     | `CELL_OUT_OF_RANGE`           | 格位越出栅格               |
+| `infeasible`     | `DUPLICATE_CELL`              | 两标记占用同一格位         |
+| `infeasible`     | `RESIDUAL_EXCEEDS_TOLERANCE`  | 逐分量残差越过容差         |
+| `infeasible`     | `DISCARD_LIMIT_EXCEEDED`      | 弃点数超过原上限           |
+| `suboptimal`     | `SUBOPTIMAL_OBJECTIVE`        | 几何可行但目标较差         |
+| `non_canonical`  | `NON_CANONICAL`               | 目标相同但参数/分配非规范  |
+
+设备侧只能写入 `accepted: true` 的规范复原结果；被拒候选可按 `category`
+明确区分不可行、次优与同优但不规范。
+
 ## 本地开发
 
 ```bash
@@ -75,5 +116,7 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 pytest -q
 python scripts/smoke.py              # 直测求解器
-BASE_URL=http://127.0.0.1:8000 python scripts/smoke.py   # 走 HTTP
+python scripts/audit_smoke.py        # 直测审计端点（TestClient）
+BASE_URL=http://127.0.0.1:8000 python scripts/smoke.py        # 走 HTTP
+BASE_URL=http://127.0.0.1:8000 python scripts/audit_smoke.py  # 走 HTTP
 ```
