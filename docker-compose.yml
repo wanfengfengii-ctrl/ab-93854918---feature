@@ -1,0 +1,25 @@
+services:
+  web:
+    build: .
+    image: wafer-grid-service:latest
+    environment:
+      API_PORT: ${API_PORT:-8000}
+    ports:
+      - "${API_PORT:-8000}:${API_PORT:-8000}"
+
+  # 一次性校验任务：等待 web 健康后执行单元测试与含漏读/杂点的复原冒烟，
+  # 以自身退出码汇报结果。用 ./verify（或 docker compose run --rm verify）触发。
+  verify:
+    build: .
+    image: wafer-grid-service:latest
+    environment:
+      API_PORT: 8000
+      BASE_URL: http://web:${API_PORT:-8000}
+    depends_on:
+      web:
+        condition: service_healthy
+    command: ["sh", "-c", "/app/scripts/verify.sh"]
+    restart: "no"
+    # 一次性任务不监听端口，关闭镜像自带的健康检查
+    healthcheck:
+      disable: true
